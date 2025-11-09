@@ -8,7 +8,8 @@ One Claude instance handles the entire workflow.
 Usage:
     python single_agent_generator.py \
         --repo /path/to/ARMCortexM-CppLib \
-        --function setBit
+        --function setBit \
+        --module bit_utils
 """
 
 import os
@@ -30,13 +31,17 @@ import config
 console = Console()
 client = Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
+# Standardized error prefix for consistent error checking (Bug #11 fix)
+ERROR_PREFIX = "ERROR: "
+
 
 class TestGenerator:
     """Single-agent test generator"""
     
-    def __init__(self, repo_path: Path, function_name: str):
+    def __init__(self, repo_path: Path, function_name: str, module: str = "bit_utils"):
         self.repo_path = Path(repo_path)
         self.function_name = function_name
+        self.module = module  # Bug #10 fix: Add module support
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         
@@ -47,7 +52,8 @@ class TestGenerator:
             with open(full_path, 'r') as f:
                 return f.read()
         except Exception as e:
-            return f"Error reading {relative_path}: {e}"
+            # Bug #11 fix: Use standardized error prefix
+            return f"{ERROR_PREFIX}Error reading {relative_path}: {e}"
     
     def write_file(self, relative_path: str, content: str) -> bool:
         """Write content to a file"""
@@ -76,20 +82,38 @@ class TestGenerator:
         
         return response.content[0].text
     
+    def get_header_path(self) -> Path:
+        """Get path to the header file for current module"""
+        return self.repo_path / f"{self.module}.hpp"
+    
+    def get_test_dir(self) -> Path:
+        """Get path to test directory for current module"""
+        return self.repo_path / "tests" / self.module.replace("/", "_")
+    
     def generate_test(self) -> Optional[str]:
         """Generate the test file"""
         
         console.print("\n[bold cyan]Step 1: Reading existing patterns...[/bold cyan]")
         
-        # Read existing test pattern
-        existing_test = self.read_file("tests/bit_utils/test_is_bit_set_runtime.cpp")
-        if "Error" in existing_test:
+        # Bug #10 fix: Use dynamic paths based on module
+        test_dir = self.get_test_dir()
+        
+        # Read existing test pattern (assume we use first available pattern)
+        pattern_files = list(test_dir.glob("test_*_runtime.cpp"))
+        if not pattern_files:
+            console.print(f"[red]{ERROR_PREFIX}No test patterns found in {test_dir}[/red]")
+            return None
+        
+        existing_test = self.read_file(str(pattern_files[0].relative_to(self.repo_path)))
+        # Bug #11 fix: Use standardized error checking
+        if existing_test.startswith(ERROR_PREFIX):
             console.print(f"[red]{existing_test}[/red]")
             return None
         
         # Read the header file
-        header = self.read_file("bit_utils.hpp")
-        if "Error" in header:
+        header_path = self.get_header_path()
+        header = self.read_file(str(header_path.relative_to(self.repo_path)))
+        if header.startswith(ERROR_PREFIX):
             console.print(f"[red]{header}[/red]")
             return None
         
@@ -102,7 +126,7 @@ class TestGenerator:
 TASK: Generate a comprehensive test file for the {self.function_name}() function.
 
 CONTEXT:
-Here's the function definition from bit_utils.hpp:
+Here's the function definition from {header_path.name}:
 ```cpp
 {header}
 ```
@@ -114,7 +138,7 @@ Here's an example test file showing the pattern to follow:
 
 REQUIREMENTS:
 1. Create test_{self.function_name.lower()}_runtime.cpp
-2. Follow the EXACT pattern from test_is_bit_set_runtime.cpp
+2. Follow the EXACT pattern from the example
 3. Test all integer types: uint8_t, uint16_t, uint32_t, uint64_t, int8_t, int16_t, int32_t, int64_t
 4. For each type, test bit positions: 0, middle bit, MSB
 5. Include CHECK directives for all three optimization levels: DEBUG, MINSIZE, MAXSPEED
@@ -183,10 +207,13 @@ OUTPUT: The complete C++ test file, nothing else. No explanations, just code."""
     def read_assembly(self, test_name: str, optimization: str = "Debug") -> str:
         """Read generated assembly"""
         preset = f"m0-gcc-{optimization.lower()}"
-        asm_path = self.repo_path / "build" / preset / "tests" / "bit_utils" / f"{test_name}.asm"
+        # Bug #10 fix: Use dynamic module path
+        module_dir = self.module.replace("/", "_")
+        asm_path = self.repo_path / "build" / preset / "tests" / module_dir / f"{test_name}.asm"
         
         if not asm_path.exists():
-            return f"Assembly file not found: {asm_path}"
+            # Bug #11 fix: Use standardized error prefix
+            return f"{ERROR_PREFIX}Assembly file not found: {asm_path}"
         
         with open(asm_path, 'r') as f:
             return f.read()
@@ -200,7 +227,8 @@ OUTPUT: The complete C++ test file, nothing else. No explanations, just code."""
         assemblies = {}
         for opt in ["Debug", "MinSize", "MaxSpeed"]:
             asm = self.read_assembly(test_name, opt)
-            if "not found" not in asm:
+            # Bug #11 fix: Use standardized error checking
+            if not asm.startswith(ERROR_PREFIX):
                 assemblies[opt] = asm
         
         if not assemblies:
@@ -253,6 +281,7 @@ OUTPUT: The complete corrected test file, nothing else."""
         console.print(Panel.fit(
             f"[bold]Generating tests for {self.function_name}()[/bold]\n"
             f"Repository: {self.repo_path}\n"
+            f"Module: {self.module}\n"
             f"Mode: Single Agent",
             title="ARMCortexM-TestGen",
             border_style="cyan"
@@ -265,27 +294,36 @@ OUTPUT: The complete corrected test file, nothing else."""
         
         # Write initial test file
         test_filename = f"test_{self.function_name.lower()}_runtime.cpp"
-        test_path = f"tests/bit_utils/{test_filename}"
+        test_dir = self.get_test_dir()
+        test_path = test_dir / test_filename
         test_name = f"test_{self.function_name.lower()}_runtime"
         
         console.print(f"\n[bold cyan]Step 3: Writing and compiling tests...[/bold cyan]")
         
-        if not self.write_file(test_path, test_code):
+        if not self.write_file(str(test_path.relative_to(self.repo_path)), test_code):
             return False
         
-        console.print(f"[green]✓ Wrote {test_path}[/green]")
+        console.print(f"[green]✓ Wrote {test_path.relative_to(self.repo_path)}[/green]")
         
         # Update CMakeLists.txt
-        cmake_path = "tests/bit_utils/CMakeLists.txt"
-        cmake_content = self.read_file(cmake_path)
+        cmake_path = test_dir / "CMakeLists.txt"
+        cmake_content = self.read_file(str(cmake_path.relative_to(self.repo_path)))
+        # Bug #11 fix: Check for error before proceeding
+        if cmake_content.startswith(ERROR_PREFIX):
+            console.print(f"[red]Cannot read CMakeLists.txt: {cmake_content}[/red]")
+            return False
+        
         if f"add_asm_test({test_name})" not in cmake_content:
-            cmake_content += f"\nadd_asm_test({test_name})\n"
-            if not self.write_file(cmake_path, cmake_content):
+            if not cmake_content.endswith('\n'):
+                cmake_content += '\n'
+            cmake_content += f"add_asm_test({test_name})\n"
+            if not self.write_file(str(cmake_path.relative_to(self.repo_path)), cmake_content):
                 return False
-            console.print(f"[green]✓ Updated {cmake_path}[/green]")
+            console.print(f"[green]✓ Updated {cmake_path.relative_to(self.repo_path)}[/green]")
         
         # Try to compile
         attempts = 0
+        all_passed = False
         while attempts < config.MAX_COMPILATION_ATTEMPTS:
             attempts += 1
             
@@ -310,7 +348,7 @@ OUTPUT: The complete corrected test file, nothing else."""
                 fixed_code = self.fix_check_directives(test_code, test_name)
                 if fixed_code:
                     test_code = fixed_code
-                    self.write_file(test_path, test_code)
+                    self.write_file(str(test_path.relative_to(self.repo_path)), test_code)
                     console.print("[yellow]Retrying with fixed CHECK directives...[/yellow]")
                 else:
                     console.print("[red]Failed to fix CHECK directives[/red]")
@@ -332,6 +370,7 @@ OUTPUT: The complete corrected test file, nothing else."""
 
 Status: {"[green]SUCCESS ✓[/green]" if success else "[red]FAILED ✗[/red]"}
 Function: {self.function_name}()
+Module: {self.module}
 
 [bold]Token Usage:[/bold]
   Input:  {self.total_input_tokens:,} tokens (${input_cost:.4f})
@@ -339,7 +378,7 @@ Function: {self.function_name}()
   Total:  ${total_cost:.4f}
 
 [bold]Output:[/bold]
-  Test file: tests/bit_utils/test_{self.function_name.lower()}_runtime.cpp
+  Test file: tests/{self.module.replace("/", "_")}/test_{self.function_name.lower()}_runtime.cpp
 """
         
         console.print(Panel(summary, title="Summary", border_style="green" if success else "red"))
@@ -349,14 +388,15 @@ Function: {self.function_name}()
 @click.option('--repo', required=True, type=click.Path(exists=True),
               help='Path to ARMCortexM-CppLib repository')
 @click.option('--function', required=True, help='Function name to generate tests for (e.g., setBit)')
-def main(repo: str, function: str):
+@click.option('--module', default='bit_utils', help='Module to test (default: bit_utils). Examples: bit_utils, intrinsics/barriers')
+def main(repo: str, function: str, module: str):
     """Generate tests using single agent mode"""
     
     if not config.ANTHROPIC_API_KEY:
         console.print("[red]Error: ANTHROPIC_API_KEY environment variable not set[/red]")
         sys.exit(1)
     
-    generator = TestGenerator(Path(repo), function)
+    generator = TestGenerator(Path(repo), function, module)
     success = generator.run()
     
     sys.exit(0 if success else 1)

@@ -42,6 +42,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Standardized error prefix for consistent error checking
+ERROR_PREFIX = "ERROR: "
+
 
 class AutonomousTestGenerator:
     """Single Claude agent that generates, compiles, and validates tests autonomously"""
@@ -119,7 +122,7 @@ class AutonomousTestGenerator:
         if not file_path.exists():
             error_msg = f"File not found: {relative_path}"
             logger.error(error_msg)
-            return f"ERROR: {error_msg}"
+            return f"{ERROR_PREFIX}{error_msg}"
         
         try:
             content = file_path.read_text()
@@ -128,7 +131,7 @@ class AutonomousTestGenerator:
         except Exception as e:
             error_msg = f"Error reading {relative_path}: {e}"
             logger.error(error_msg)
-            return f"ERROR: {error_msg}"
+            return f"{ERROR_PREFIX}{error_msg}"
     
     def write_file(self, relative_path: str, content: str) -> bool:
         """Write file to repo"""
@@ -144,24 +147,33 @@ class AutonomousTestGenerator:
     
     def get_header_path(self) -> Path:
         """Get path to the header file for current module"""
-        if "/" in self.module:
-            # Module like "intrinsics/barriers"
-            return self.repo_path / f"{self.module}.hpp"
-        else:
-            # Module like "bit_utils"
-            return self.repo_path / f"{self.module}.hpp"
+        # Bug #16 fix: Remove useless if statement and add validation
+        header_path = self.repo_path / f"{self.module}.hpp"
+        
+        if not header_path.exists():
+            logger.error(f"Header file not found: {header_path}")
+            logger.info(f"Expected: {header_path}")
+            logger.info(f"Module: {self.module}")
+            raise FileNotFoundError(f"Header file not found: {header_path}")
+        
+        return header_path
     
     def get_test_dir(self) -> Path:
         """Get path to test directory for current module"""
-        return self.repo_path / "tests" / self.module.replace("/", "_")
+        # Bug #17 fix: Create directory if it doesn't exist
+        test_dir = self.repo_path / "tests" / self.module.replace("/", "_")
+        
+        if not test_dir.exists():
+            logger.warning(f"Test directory does not exist: {test_dir}")
+            logger.info(f"Creating test directory...")
+            test_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"✓ Created test directory: {test_dir}")
+        
+        return test_dir
     
     def validate_function(self, function_name: str) -> Optional[FunctionSignature]:
         """Validate that function exists and get its signature"""
         header_path = self.get_header_path()
-        
-        if not header_path.exists():
-            logger.error(f"Header file not found: {header_path}")
-            return None
         
         logger.info(f"Validating function '{function_name}' in {header_path.name}...")
         signature = validate_function_exists(header_path, function_name)
@@ -247,7 +259,7 @@ class AutonomousTestGenerator:
         if not asm_path.exists():
             error_msg = f"Assembly file not found: {asm_path}"
             logger.warning(error_msg)
-            return f"ERROR: {error_msg}"
+            return f"{ERROR_PREFIX}{error_msg}"
         
         return asm_path.read_text()
     
@@ -279,7 +291,7 @@ class AutonomousTestGenerator:
         logger.info(f"✓ Read pattern ({len(existing_test)} bytes): {pattern_file.name}")
         
         header = self.read_file(self.get_header_path().name)
-        if header.startswith("ERROR"):
+        if header.startswith(ERROR_PREFIX):
             return False
         logger.info(f"✓ Read header file ({len(header)} bytes)")
         
@@ -355,6 +367,11 @@ OUTPUT: The complete C++ test file only. No explanations, no markdown, just the 
         cmake_path = test_dir / "CMakeLists.txt"
         cmake_content = self.read_file(str(cmake_path.relative_to(self.repo_path)))
         
+        # Bug #12 fix: Validate CMakeLists.txt read before using it
+        if cmake_content.startswith(ERROR_PREFIX):
+            logger.error(f"Cannot update CMakeLists.txt: {cmake_content}")
+            return False
+        
         # Check if test already exists in CMakeLists.txt
         test_declaration = f"add_asm_test({test_name})"
         if test_declaration not in cmake_content:
@@ -394,12 +411,18 @@ OUTPUT: The complete C++ test file only. No explanations, no markdown, just the 
                 for opt, result in failed_optimizations:
                     if result["stage"] == "test":  # Only if we got to testing
                         asm = self.read_assembly(test_name, opt)
-                        if not asm.startswith("ERROR"):
+                        if not asm.startswith(ERROR_PREFIX):
                             assemblies[opt] = asm
                 
+                # Bug #13 fix: Better error recovery strategy
                 if not assemblies:
-                    logger.warning("No assembly available to analyze")
-                    continue
+                    logger.warning("No assembly available - failures at build/configure stage")
+                    logger.warning("Cannot fix CHECK directives without assembly")
+                    logger.warning("Check compilation errors above")
+                    # Show some error details
+                    for opt, result in failed_optimizations:
+                        logger.error(f"{opt} failed at {result['stage']}: {result['output'][:300]}")
+                    break  # Give up, not worth retrying
                 
                 # Ask Claude to fix
                 fix_prompt = f"""The test file has CHECK directive mismatches. Fix them.

@@ -46,11 +46,19 @@ runs:
       shell: bash
       env:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        # Bug #15 fix: Resolve repo path relative to workspace, not action path
+        REPO_PATH_RESOLVED: ${{ github.workspace }}/${{ inputs.repo-path }}
       run: |
-        cd ${{ github.action_path }}
-        python3 autonomous_test_generator.py \
+        # Use absolute path for action script, work from repo directory
+        ACTION_SCRIPT="${{ github.action_path }}/autonomous_test_generator.py"
+        
+        # Change to the repository directory (resolved absolute path)
+        cd "$REPO_PATH_RESOLVED"
+        
+        # Run generator from repo directory with current directory as repo path
+        python3 "$ACTION_SCRIPT" \
           --functions ${{ inputs.functions }} \
-          --repo-path ${{ inputs.repo-path }} \
+          --repo-path . \
           --module ${{ inputs.module }} \
           --max-cost ${{ inputs.max-cost }}
     
@@ -59,7 +67,7 @@ runs:
       uses: actions/upload-artifact@v4
       with:
         name: testgen-log
-        path: testgen.log
+        path: ${{ github.workspace }}/${{ inputs.repo-path }}/testgen.log
         retention-days: 7
 
 branding:

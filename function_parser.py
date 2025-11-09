@@ -115,19 +115,31 @@ class FunctionParser:
         )
     
     def _split_parameters(self, params_str: str) -> List[str]:
-        """Split parameter string by comma, respecting nested templates"""
+        """
+        Split parameter string by comma, respecting nested templates and function pointers.
+        
+        Bug #14 fix: Now handles function pointer parameters properly.
+        """
         params = []
         current = []
-        depth = 0
+        template_depth = 0
+        paren_depth = 0
         
         for char in params_str:
             if char == '<':
-                depth += 1
+                template_depth += 1
                 current.append(char)
             elif char == '>':
-                depth -= 1
+                template_depth -= 1
                 current.append(char)
-            elif char == ',' and depth == 0:
+            elif char == '(':
+                paren_depth += 1
+                current.append(char)
+            elif char == ')':
+                paren_depth -= 1
+                current.append(char)
+            elif char == ',' and template_depth == 0 and paren_depth == 0:
+                # Only split on commas outside templates and parentheses
                 params.append(''.join(current))
                 current = []
             else:
@@ -238,6 +250,11 @@ if __name__ == "__main__":
     constexpr T readBit(const T& value, uint8_t n) {
         return (value >> n) & T{1};
     }
+    
+    // Bug #14 test: Function pointer parameter
+    void registerCallback(void (*callback)(int, int), int data) {
+        callback(data, data);
+    }
     """
     
     parser = FunctionParser(test_header)
@@ -260,6 +277,17 @@ if __name__ == "__main__":
         print(f"Return type: {sig.return_type}")
         print(f"Pattern file: {sig.pattern_file}")
         print(f"Test type: {sig.test_type}")
+        print()
+    
+    # Bug #14 test: Function pointer
+    sig = parser.find_function("registerCallback")
+    if sig:
+        print(f"Function: {sig.name}")
+        print(f"Return type: {sig.return_type}")
+        print(f"Parameters: {sig.parameters}")
+        print(f"Number of params: {len(sig.parameters)}")
+        assert len(sig.parameters) == 2, "Should have 2 parameters"
+        print("✓ Function pointer parsing works!")
         print()
     
     # List all functions

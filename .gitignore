@@ -14,3 +14,5 @@ build/
 .vscode/
 output/
 test_output/
+testgen.log
+*.log

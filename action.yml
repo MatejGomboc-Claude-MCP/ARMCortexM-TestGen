@@ -1,0 +1,50 @@
+name: 'ARMCortexM Test Generator'
+description: 'AI-powered autonomous test generator using Claude. Generates and validates assembly tests.'
+author: 'MatejGomboc-Claude-MCP'
+
+inputs:
+  functions:
+    description: 'Space-separated list of function names to generate tests for (e.g., "setBit clearBit")'
+    required: true
+  anthropic-api-key:
+    description: 'Anthropic API key for Claude'
+    required: true
+  max-cost:
+    description: 'Maximum API cost in USD (default: 50.0)'
+    required: false
+    default: '50.0'
+  repo-path:
+    description: 'Path to repository (default: current directory)'
+    required: false
+    default: '.'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Python
+      shell: bash
+      run: |
+        if ! command -v python3 &> /dev/null; then
+          echo "Installing Python..."
+          apt-get update && apt-get install -y python3 python3-pip
+        fi
+    
+    - name: Install dependencies
+      shell: bash
+      run: |
+        python3 -m pip install --upgrade pip
+        python3 -m pip install anthropic
+    
+    - name: Run autonomous test generator
+      shell: bash
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+      run: |
+        python3 ${{ github.action_path }}/autonomous_test_generator.py \
+          --functions ${{ inputs.functions }} \
+          --repo-path ${{ inputs.repo-path }} \
+          --max-cost ${{ inputs.max-cost }}
+
+branding:
+  icon: 'cpu'
+  color: 'blue'

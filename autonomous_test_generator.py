@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import time
+import logging
 
 try:
     import anthropic
@@ -24,14 +25,32 @@ except ImportError:
     subprocess.run([sys.executable, "-m", "pip", "install", "anthropic"], check=True)
     import anthropic
 
+from anthropic import RateLimitError
+
+# Import our function parser
+from function_parser import FunctionParser, validate_function_exists, FunctionSignature
+
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('testgen.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
 
 class AutonomousTestGenerator:
     """Single Claude agent that generates, compiles, and validates tests autonomously"""
     
-    def __init__(self, repo_path: Path, api_key: str, max_cost: float = 50.0):
+    def __init__(self, repo_path: Path, api_key: str, max_cost: float = 50.0, module: str = "bit_utils"):
         self.repo_path = Path(repo_path)
         self.client = anthropic.Anthropic(api_key=api_key)
         self.max_cost = max_cost
+        self.module = module
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.total_cost = 0.0
@@ -39,6 +58,10 @@ class AutonomousTestGenerator:
         # Cost per 1M tokens
         self.input_cost_per_million = 3.0
         self.output_cost_per_million = 15.0
+        
+        logger.info(f"Initialized generator for module: {module}")
+        logger.info(f"Repository path: {repo_path}")
+        logger.info(f"Max cost: ${max_cost}")
     
     def calculate_cost(self, input_tokens: int, output_tokens: int) -> float:
         """Calculate API cost"""
@@ -47,39 +70,65 @@ class AutonomousTestGenerator:
         return input_cost + output_cost
     
     def call_claude(self, prompt: str, max_tokens: int = 8000) -> str:
-        """Make API call to Claude"""
-        print(f"\n🤖 Calling Claude API...")
+        """Make API call to Claude with rate limit handling"""
+        logger.info("Calling Claude API...")
         
-        response = self.client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=max_tokens,
-            temperature=0.2,  # Low temp for consistency
-            messages=[{"role": "user", "content": prompt}]
-        )
-        
-        # Track usage
-        self.total_input_tokens += response.usage.input_tokens
-        self.total_output_tokens += response.usage.output_tokens
-        
-        cost = self.calculate_cost(response.usage.input_tokens, response.usage.output_tokens)
-        self.total_cost += cost
-        
-        print(f"   Input tokens: {response.usage.input_tokens:,}")
-        print(f"   Output tokens: {response.usage.output_tokens:,}")
-        print(f"   Call cost: ${cost:.4f}")
-        print(f"   Total cost so far: ${self.total_cost:.4f}")
-        
-        if self.total_cost > self.max_cost:
-            raise RuntimeError(f"Cost limit ${self.max_cost} exceeded!")
-        
-        return response.content[0].text
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                response = self.client.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=max_tokens,
+                    temperature=0.2,  # Low temp for consistency
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                
+                # Track usage
+                self.total_input_tokens += response.usage.input_tokens
+                self.total_output_tokens += response.usage.output_tokens
+                
+                cost = self.calculate_cost(response.usage.input_tokens, response.usage.output_tokens)
+                self.total_cost += cost
+                
+                logger.info(f"   Input tokens: {response.usage.input_tokens:,}")
+                logger.info(f"   Output tokens: {response.usage.output_tokens:,}")
+                logger.info(f"   Call cost: ${cost:.4f}")
+                logger.info(f"   Total cost so far: ${self.total_cost:.4f}")
+                
+                if self.total_cost > self.max_cost:
+                    raise RuntimeError(
+                        f"Cost limit ${self.max_cost} exceeded!\n"
+                        f"   Spent: ${self.total_cost:.2f}\n"
+                        f"   Suggestion: Increase --max-cost to continue"
+                    )
+                
+                return response.content[0].text
+                
+            except RateLimitError as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff: 1, 2, 4, 8, 16 seconds
+                    logger.warning(f"⏳ Rate limited, waiting {wait_time}s... (attempt {attempt + 1}/{max_retries})")
+                    time.sleep(wait_time)
+                else:
+                    logger.error("❌ Rate limit exceeded after all retries")
+                    raise
     
     def read_file(self, relative_path: str) -> str:
         """Read file from repo"""
         file_path = self.repo_path / relative_path
         if not file_path.exists():
-            return f"ERROR: File not found: {relative_path}"
-        return file_path.read_text()
+            error_msg = f"File not found: {relative_path}"
+            logger.error(error_msg)
+            return f"ERROR: {error_msg}"
+        
+        try:
+            content = file_path.read_text()
+            logger.debug(f"Read {relative_path} ({len(content)} bytes)")
+            return content
+        except Exception as e:
+            error_msg = f"Error reading {relative_path}: {e}"
+            logger.error(error_msg)
+            return f"ERROR: {error_msg}"
     
     def write_file(self, relative_path: str, content: str) -> bool:
         """Write file to repo"""
@@ -87,16 +136,54 @@ class AutonomousTestGenerator:
         try:
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text(content)
+            logger.info(f"Wrote {relative_path}")
             return True
         except Exception as e:
-            print(f"❌ Error writing {relative_path}: {e}")
+            logger.error(f"Error writing {relative_path}: {e}")
             return False
+    
+    def get_header_path(self) -> Path:
+        """Get path to the header file for current module"""
+        if "/" in self.module:
+            # Module like "intrinsics/barriers"
+            return self.repo_path / f"{self.module}.hpp"
+        else:
+            # Module like "bit_utils"
+            return self.repo_path / f"{self.module}.hpp"
+    
+    def get_test_dir(self) -> Path:
+        """Get path to test directory for current module"""
+        return self.repo_path / "tests" / self.module.replace("/", "_")
+    
+    def validate_function(self, function_name: str) -> Optional[FunctionSignature]:
+        """Validate that function exists and get its signature"""
+        header_path = self.get_header_path()
+        
+        if not header_path.exists():
+            logger.error(f"Header file not found: {header_path}")
+            return None
+        
+        logger.info(f"Validating function '{function_name}' in {header_path.name}...")
+        signature = validate_function_exists(header_path, function_name)
+        
+        if signature is None:
+            logger.error(f"Function '{function_name}' not found in {header_path.name}")
+            return None
+        
+        logger.info(f"✓ Found function: {signature.name}")
+        logger.info(f"  Return type: {signature.return_type}")
+        logger.info(f"  Parameters: {signature.parameters}")
+        logger.info(f"  Modifies reference: {signature.modifies_reference}")
+        logger.info(f"  Pattern file: {signature.pattern_file}")
+        logger.info(f"  Test type: {signature.test_type}")
+        
+        return signature
     
     def compile_and_test(self, test_name: str, optimization: str) -> Dict[str, Any]:
         """Compile and run tests for a specific optimization level"""
         preset = f"m0-gcc-{optimization.lower()}"
         
-        print(f"\n🔨 Compiling {optimization}...")
+        logger.info(f"Compiling {optimization}...")
         
         # Configure
         result = subprocess.run(
@@ -107,6 +194,7 @@ class AutonomousTestGenerator:
             timeout=120
         )
         if result.returncode != 0:
+            logger.error(f"Configure failed: {result.stderr[:200]}")
             return {
                 "success": False,
                 "stage": "configure",
@@ -122,6 +210,7 @@ class AutonomousTestGenerator:
             timeout=180
         )
         if result.returncode != 0:
+            logger.error(f"Build failed: {result.stderr[:200]}")
             return {
                 "success": False,
                 "stage": "build",
@@ -137,6 +226,11 @@ class AutonomousTestGenerator:
             timeout=60
         )
         
+        if result.returncode == 0:
+            logger.info(f"✓ {optimization} tests passed")
+        else:
+            logger.warning(f"✗ {optimization} tests failed")
+        
         return {
             "success": result.returncode == 0,
             "stage": "test",
@@ -146,48 +240,91 @@ class AutonomousTestGenerator:
     def read_assembly(self, test_name: str, optimization: str) -> str:
         """Read generated assembly file"""
         preset = f"m0-gcc-{optimization.lower()}"
-        asm_path = self.repo_path / "build" / preset / "tests" / "bit_utils" / f"{test_name}.asm"
+        # Dynamic path based on module
+        module_dir = self.module.replace("/", "_")
+        asm_path = self.repo_path / "build" / preset / "tests" / module_dir / f"{test_name}.asm"
         
         if not asm_path.exists():
-            return f"ERROR: Assembly file not found: {asm_path}"
+            error_msg = f"Assembly file not found: {asm_path}"
+            logger.warning(error_msg)
+            return f"ERROR: {error_msg}"
         
         return asm_path.read_text()
     
     def generate_test(self, function_name: str) -> bool:
         """Generate and validate tests for a single function"""
         
-        print(f"\n{'='*70}")
-        print(f"🎯 GENERATING TESTS FOR {function_name}()")
-        print('='*70)
+        logger.info("=" * 70)
+        logger.info(f"GENERATING TESTS FOR {function_name}()")
+        logger.info("=" * 70)
         
-        # Read context
-        print("\n📖 Reading existing patterns...")
-        existing_test = self.read_file("tests/bit_utils/test_is_bit_set_runtime.cpp")
-        if existing_test.startswith("ERROR"):
-            print(f"❌ {existing_test}")
+        # Validate function exists and get signature
+        signature = self.validate_function(function_name)
+        if signature is None:
             return False
         
-        header = self.read_file("bit_utils.hpp")
+        # Read context - use appropriate pattern based on function signature
+        logger.info("Reading existing patterns...")
+        test_dir = self.get_test_dir()
+        pattern_file = test_dir / signature.pattern_file
+        
+        if not pattern_file.exists():
+            logger.error(f"Pattern file not found: {pattern_file}")
+            logger.info("Available patterns:")
+            for p in test_dir.glob("test_*_runtime.cpp"):
+                logger.info(f"  - {p.name}")
+            return False
+        
+        existing_test = pattern_file.read_text()
+        logger.info(f"✓ Read pattern ({len(existing_test)} bytes): {pattern_file.name}")
+        
+        header = self.read_file(self.get_header_path().name)
         if header.startswith("ERROR"):
-            print(f"❌ {header}")
             return False
+        logger.info(f"✓ Read header file ({len(header)} bytes)")
         
-        print(f"   ✓ Read test pattern ({len(existing_test)} bytes)")
-        print(f"   ✓ Read header file ({len(header)} bytes)")
+        # Generate initial test with signature-aware prompt
+        logger.info(f"Generating test code for {function_name}()...")
         
-        # Generate initial test
-        print(f"\n🤖 Generating test code for {function_name}()...")
+        # Build signature-aware instructions
+        if signature.test_type == "void-modifying":
+            signature_notes = f"""
+IMPORTANT NOTES ABOUT {function_name}():
+- This function MODIFIES a reference parameter: {signature.parameters[0]}
+- Assembly will include MEMORY OPERATIONS (ldr/str instructions)
+- The value is loaded, modified, and stored back
+"""
+        elif signature.test_type == "bool-returning":
+            signature_notes = f"""
+IMPORTANT NOTES ABOUT {function_name}():
+- This function RETURNS a bool value
+- Assembly will use comparison and conditional instructions
+- No memory writes, only reads and comparisons
+"""
+        else:
+            signature_notes = f"""
+IMPORTANT NOTES ABOUT {function_name}():
+- This function returns: {signature.return_type}
+- Parameters: {', '.join(signature.parameters)}
+"""
         
         prompt = f"""You are an expert in ARM Cortex-M assembly and C++ embedded systems testing.
 
 TASK: Generate test_{function_name.lower()}_runtime.cpp following the EXACT pattern.
 
-HEADER FILE (bit_utils.hpp):
+FUNCTION SIGNATURE:
+```cpp
+{signature.return_type} {signature.name}({', '.join(signature.parameters)})
+```
+
+{signature_notes}
+
+HEADER FILE ({self.get_header_path().name}):
 ```cpp
 {header}
 ```
 
-PATTERN TO FOLLOW (test_is_bit_set_runtime.cpp):
+PATTERN TO FOLLOW ({signature.pattern_file}):
 ```cpp
 {existing_test}
 ```
@@ -197,10 +334,9 @@ REQUIREMENTS:
 2. For each type, test bit positions: 0, middle bit, MSB
 3. Include CHECK directives for DEBUG, MINSIZE, MAXSPEED optimizations
 4. Use extern "C" [[gnu::naked]] for all test functions
-5. Remember: {function_name} modifies a reference (T& value), so assembly will include memory operations
-6. For signed types checking MSB: bit 7 of int8_t and bit 15 of int16_t become bit 31 after sign extension
-7. MAXSPEED optimization adds NOP padding for alignment
-8. Each function ends with CHECK-EMPTY:
+5. For signed types checking MSB: bit 7 of int8_t and bit 15 of int16_t become bit 31 after sign extension
+6. MAXSPEED optimization adds NOP padding for alignment
+7. Each function ends with CHECK-EMPTY:
 
 OUTPUT: The complete C++ test file only. No explanations, no markdown, just the raw C++ code."""
 
@@ -208,28 +344,33 @@ OUTPUT: The complete C++ test file only. No explanations, no markdown, just the 
         
         # Write test file
         test_filename = f"test_{function_name.lower()}_runtime.cpp"
-        test_path = f"tests/bit_utils/{test_filename}"
+        test_path = test_dir / test_filename
         test_name = f"test_{function_name.lower()}_runtime"
         
-        print(f"\n✍️  Writing {test_path}...")
-        if not self.write_file(test_path, test_code):
+        logger.info(f"Writing {test_path.relative_to(self.repo_path)}...")
+        if not self.write_file(str(test_path.relative_to(self.repo_path)), test_code):
             return False
-        print(f"   ✓ Wrote {test_path}")
         
         # Update CMakeLists.txt
-        cmake_path = "tests/bit_utils/CMakeLists.txt"
-        cmake_content = self.read_file(cmake_path)
-        if f"add_asm_test({test_name})" not in cmake_content:
-            cmake_content += f"\nadd_asm_test({test_name})\n"
-            self.write_file(cmake_path, cmake_content)
-            print(f"   ✓ Updated CMakeLists.txt")
+        cmake_path = test_dir / "CMakeLists.txt"
+        cmake_content = self.read_file(str(cmake_path.relative_to(self.repo_path)))
+        
+        # Check if test already exists in CMakeLists.txt
+        test_declaration = f"add_asm_test({test_name})"
+        if test_declaration not in cmake_content:
+            # Add at the end, preserving formatting
+            if not cmake_content.endswith('\n'):
+                cmake_content += '\n'
+            cmake_content += f"{test_declaration}\n"
+            self.write_file(str(cmake_path.relative_to(self.repo_path)), cmake_content)
+            logger.info("✓ Updated CMakeLists.txt")
         
         # Try to compile and test (with retries)
         max_attempts = 3
         for attempt in range(1, max_attempts + 1):
-            print(f"\n{'─'*70}")
-            print(f"🔄 ATTEMPT {attempt}/{max_attempts}")
-            print('─'*70)
+            logger.info("─" * 70)
+            logger.info(f"ATTEMPT {attempt}/{max_attempts}")
+            logger.info("─" * 70)
             
             all_passed = True
             failed_optimizations = []
@@ -237,19 +378,16 @@ OUTPUT: The complete C++ test file only. No explanations, no markdown, just the 
             for optimization in ["Debug", "MinSize", "MaxSpeed"]:
                 result = self.compile_and_test(test_name, optimization)
                 
-                if result["success"]:
-                    print(f"   ✅ {optimization} tests passed")
-                else:
-                    print(f"   ❌ {optimization} tests failed at {result['stage']}")
+                if not result["success"]:
                     all_passed = False
                     failed_optimizations.append((optimization, result))
             
             if all_passed:
-                print(f"\n🎉 SUCCESS! All tests pass for {function_name}()")
+                logger.info(f"🎉 SUCCESS! All tests pass for {function_name}()")
                 return True
             
             if attempt < max_attempts:
-                print(f"\n🔧 Fixing failures...")
+                logger.info("Fixing failures...")
                 
                 # Collect assembly for failed optimizations
                 assemblies = {}
@@ -260,7 +398,7 @@ OUTPUT: The complete C++ test file only. No explanations, no markdown, just the 
                             assemblies[opt] = asm
                 
                 if not assemblies:
-                    print("   ❌ No assembly available to analyze")
+                    logger.warning("No assembly available to analyze")
                     continue
                 
                 # Ask Claude to fix
@@ -289,22 +427,22 @@ OUTPUT: The complete corrected C++ test file only. No explanations, just the cod
 
                 test_code = self.call_claude(fix_prompt, max_tokens=12000)
                 
-                print(f"\n✍️  Writing corrected version...")
-                self.write_file(test_path, test_code)
-                print(f"   ✓ Updated {test_path}")
+                logger.info("Writing corrected version...")
+                self.write_file(str(test_path.relative_to(self.repo_path)), test_code)
         
-        print(f"\n❌ FAILED: Could not get tests passing after {max_attempts} attempts")
+        logger.error(f"FAILED: Could not get tests passing after {max_attempts} attempts")
         return False
     
     def run(self, functions: List[str]) -> Dict[str, Any]:
         """Run autonomous test generation for multiple functions"""
         
-        print("\n" + "="*70)
-        print("🤖 AUTONOMOUS TEST GENERATOR")
-        print("="*70)
-        print(f"Functions to test: {', '.join(functions)}")
-        print(f"Max cost: ${self.max_cost}")
-        print("="*70)
+        logger.info("=" * 70)
+        logger.info("🤖 AUTONOMOUS TEST GENERATOR")
+        logger.info("=" * 70)
+        logger.info(f"Functions to test: {', '.join(functions)}")
+        logger.info(f"Module: {self.module}")
+        logger.info(f"Max cost: ${self.max_cost}")
+        logger.info("=" * 70)
         
         start_time = time.time()
         results = {}
@@ -317,7 +455,7 @@ OUTPUT: The complete corrected C++ test file only. No explanations, just the cod
                     "error": None
                 }
             except Exception as e:
-                print(f"\n❌ ERROR: {e}")
+                logger.exception(f"ERROR processing {func}")
                 results[func] = {
                     "success": False,
                     "error": str(e)
@@ -327,20 +465,20 @@ OUTPUT: The complete corrected C++ test file only. No explanations, just the cod
         elapsed = time.time() - start_time
         
         # Print summary
-        print("\n" + "="*70)
-        print("📊 FINAL SUMMARY")
-        print("="*70)
+        logger.info("=" * 70)
+        logger.info("📊 FINAL SUMMARY")
+        logger.info("=" * 70)
         
         for func, result in results.items():
             status = "✅ PASS" if result["success"] else "❌ FAIL"
-            print(f"{status} - {func}()")
+            logger.info(f"{status} - {func}()")
             if result["error"]:
-                print(f"       Error: {result['error']}")
+                logger.info(f"       Error: {result['error']}")
         
-        print(f"\n⏱️  Time: {elapsed/60:.1f} minutes")
-        print(f"💰 Cost: ${self.total_cost:.2f}")
-        print(f"🎟️  Tokens: {self.total_input_tokens:,} in, {self.total_output_tokens:,} out")
-        print("="*70)
+        logger.info(f"\n⏱️  Time: {elapsed/60:.1f} minutes")
+        logger.info(f"💰 Cost: ${self.total_cost:.2f}")
+        logger.info(f"🎟️  Tokens: {self.total_input_tokens:,} in, {self.total_output_tokens:,} out")
+        logger.info("=" * 70)
         
         return {
             "results": results,
@@ -369,6 +507,12 @@ def main():
         help="Path to ARMCortexM-CppLib repository (default: current directory)"
     )
     parser.add_argument(
+        "--module",
+        type=str,
+        default="bit_utils",
+        help="Module to test (default: bit_utils). Examples: bit_utils, intrinsics/barriers"
+    )
+    parser.add_argument(
         "--max-cost",
         type=float,
         default=50.0,
@@ -380,14 +524,15 @@ def main():
     # Get API key from environment
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        print("❌ ERROR: ANTHROPIC_API_KEY environment variable not set")
+        logger.error("ANTHROPIC_API_KEY environment variable not set")
         sys.exit(1)
     
     # Run generator
     generator = AutonomousTestGenerator(
         repo_path=Path(args.repo_path),
         api_key=api_key,
-        max_cost=args.max_cost
+        max_cost=args.max_cost,
+        module=args.module
     )
     
     summary = generator.run(args.functions)
